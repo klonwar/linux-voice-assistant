@@ -689,6 +689,7 @@ def process_audio(state: ServerState, mic, block_size: int):
                 if state.satellite is None or not hasattr(state.satellite, "_is_streaming_audio"):
                     continue
 
+                # Keep local wake-word detection running when no audio is streamed to Home Assistant.
                 # WAKE WORD
                 if (not wake_words) or (state.wake_words_changed and state.wake_words):
                     # Update list of wake word models to process
