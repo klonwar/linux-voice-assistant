@@ -643,6 +643,21 @@ def _setup_logging(args: argparse.Namespace) -> None:
 def process_audio(state: ServerState, mic, block_size: int):
     """Process audio chunks from the microphone."""
     n_channels = state.audio_input_channels
+    diagnostics_interval = 20.0
+    next_diagnostics_at = time.monotonic() + diagnostics_interval
+    captured_blocks = 0
+    last_block_at = time.monotonic()
+    webrtc_empty_blocks = 0
+    last_webrtc_output_at: Optional[float] = None
+    micro_feature_frames = 0
+    oww_feature_frames = 0
+    inference_frames: dict[str, int] = {}
+    last_inference_at: dict[str, float] = {}
+    last_probabilities: dict[str, float] = {}
+    probability_window_min: dict[str, float] = {}
+    probability_window_max: dict[str, float] = {}
+    activation_counts: dict[str, int] = {}
+    last_activation_log_at: dict[str, float] = {}
 
     wake_words: List[Union[MicroWakeWord, OpenWakeWord]] = []
     micro_features: Optional[MicroWakeWordFeatures] = None
@@ -651,16 +666,81 @@ def process_audio(state: ServerState, mic, block_size: int):
     oww_features: Optional[OpenWakeWordFeatures] = None
     oww_inputs: List[np.ndarray] = []
     has_oww = False
+    last_logged_model_ids: Optional[tuple[str, ...]] = None
 
     last_active: Optional[float] = None
     webrtc: Optional[WebRTCProcessor] = None
 
     try:
-        _LOGGER.debug("Opening audio input device: %s", mic.name)
+        _LOGGER.info(
+            "Audio diagnostics: opening recorder (device=%s, samplerate=16000, channels=%d, block_size=%d, WebRTC AGC=%s, NS=%s)",
+            mic.name,
+            n_channels,
+            block_size,
+            state.preferences.mic_auto_gain or 0,
+            state.preferences.mic_noise_suppression or 0,
+        )
         with mic.recorder(samplerate=16000, channels=n_channels, blocksize=block_size) as mic_in:
+            _LOGGER.info("Audio diagnostics: recorder opened")
             while True:
                 # Shape: (block_size, n_channels) for stereo, (block_size, 1) for mono.
                 raw = mic_in.record(block_size)  # float32, range [-1, 1]
+                captured_blocks += 1
+                now = time.monotonic()
+                block_interval = now - last_block_at
+                last_block_at = now
+                if now >= next_diagnostics_at:
+                    webrtc_enabled = bool(state.preferences.mic_auto_gain or state.preferences.mic_noise_suppression)
+                    if not webrtc_enabled:
+                        webrtc_output_age: Union[str, float] = "disabled"
+                    elif last_webrtc_output_at is None:
+                        webrtc_output_age = "never"
+                    else:
+                        webrtc_output_age = round(now - last_webrtc_output_at, 3)
+                    inference_ages = {
+                        model_id: round(now - processed_at, 3)
+                        for model_id, processed_at in last_inference_at.items()
+                    }
+                    probability_window = {
+                        model_id: {
+                            "min": probability_window_min[model_id],
+                            "max": probability_window_max[model_id],
+                            "last": last_probabilities[model_id],
+                        }
+                        for model_id in probability_window_min
+                    }
+                    _LOGGER.info(
+                        "Audio diagnostics: blocks=%d, last_block_interval=%.3fs, WebRTC=%s, WebRTC_empty_blocks=%d, "
+                        "WebRTC_output_age=%s, "
+                        "active_models=%s, thresholds=%s, micro_feature_frames=%d, openwakeword_feature_frames=%d, "
+                        "inference_frames=%s, last_inference_ages=%s, activation_counts=%s, probability_window=%s, "
+                        "muted=%s, pipeline_active=%s, streaming_audio=%s",
+                        captured_blocks,
+                        block_interval,
+                        webrtc_enabled,
+                        webrtc_empty_blocks,
+                        webrtc_output_age,
+                        [getattr(model, "id", "unknown") for model in wake_words],
+                        [
+                            (
+                                model.id,
+                                state.wake_word_1_threshold if idx == 0 else state.wake_word_2_threshold if idx == 1 else 0.7,
+                            )
+                            for idx, model in enumerate(wake_words)
+                        ],
+                        micro_feature_frames,
+                        oww_feature_frames,
+                        inference_frames,
+                        inference_ages,
+                        activation_counts,
+                        probability_window,
+                        state.muted,
+                        getattr(state.satellite, "_pipeline_active", None),
+                        getattr(state.satellite, "_is_streaming_audio", None),
+                    )
+                    probability_window_min.clear()
+                    probability_window_max.clear()
+                    next_diagnostics_at = now + diagnostics_interval
                 mic_vol_scalar = max(0.1, min(1.0, state.mic_volume / 100.0))
 
                 # Build per-channel byte arrays.  Channel 0 is the primary
@@ -684,7 +764,9 @@ def process_audio(state: ServerState, mic, block_size: int):
                         webrtc.update_settings(agc, ns)
                     audio_chunk = webrtc.process(audio_chunk)
                     if not audio_chunk:
+                        webrtc_empty_blocks += 1
                         continue
+                    last_webrtc_output_at = time.monotonic()
 
                 if state.satellite is None or not hasattr(state.satellite, "_is_streaming_audio"):
                     continue
@@ -694,6 +776,19 @@ def process_audio(state: ServerState, mic, block_size: int):
                     # Update list of wake word models to process
                     state.wake_words_changed = False
                     wake_words = [ww for ww in state.wake_words.values() if ww.id in state.active_wake_words]
+                    model_ids = tuple(getattr(model, "id", "unknown") for model in wake_words)
+                    if model_ids != last_logged_model_ids:
+                        _LOGGER.info(
+                            "Wake-word diagnostics: active models=%s",
+                            [
+                                {
+                                    "id": getattr(model, "id", "unknown"),
+                                    "type": "openWakeWord" if isinstance(model, OpenWakeWord) else "microWakeWord",
+                                }
+                                for model in wake_words
+                            ],
+                        )
+                        last_logged_model_ids = model_ids
 
                     # TODO: Load default stop word value from json into state and preferences missing.
 
@@ -721,6 +816,13 @@ def process_audio(state: ServerState, mic, block_size: int):
                             else:
                                 state.wake_word_2_threshold = default_threshold
                             _LOGGER.debug("Wake Word 2 threshold set to %.3f (was %.3f, preferences: %s)", state.wake_word_2_threshold, old_val, state.preferences.wake_word_2_sensitivity)
+
+                        _LOGGER.info(
+                            "Wake-word model configured: id=%s, type=%s, threshold=%.3f",
+                            wake_word_id,
+                            "openWakeWord" if isinstance(wake_word, OpenWakeWord) else "microWakeWord",
+                            state.wake_word_1_threshold if idx == 0 else state.wake_word_2_threshold if idx == 1 else 0.7,
+                        )
 
                         if isinstance(wake_word, OpenWakeWord):
                             has_oww = True
@@ -772,22 +874,29 @@ def process_audio(state: ServerState, mic, block_size: int):
                     if has_oww and (oww_features is None):
                         oww_features = OpenWakeWordFeatures.from_builtin()
 
+                processing_step = "audio_wake_word_pipeline"
                 try:
                     # Both channels travel in one message: data=ch0 (enhanced), data2=ch1 (raw reference)
                     audio_chunk_2 = channel_chunks[1] if n_channels >= 2 else None
+                    processing_step = "satellite_audio_delivery"
                     state.satellite.handle_audio(audio_chunk, audio_chunk_2)
 
                     assert micro_features is not None
+                    processing_step = "micro_wake_word_feature_extraction"
                     micro_inputs.clear()
                     micro_inputs.extend(micro_features.process_streaming(audio_chunk))
+                    micro_feature_frames += len(micro_inputs)
 
                     if has_oww:
                         assert oww_features is not None
+                        processing_step = "openwakeword_feature_extraction"
                         oww_inputs.clear()
                         oww_inputs.extend(oww_features.process_streaming(audio_chunk))
+                        oww_feature_frames += len(oww_inputs)
 
                     for wake_word_index, wake_word in enumerate(wake_words):
                         activated = False
+                        activation_score: Optional[float] = None
 
                         # Set dynamic threshold depending on wake word index
                         if wake_word_index == 0:
@@ -807,23 +916,64 @@ def process_audio(state: ServerState, mic, block_size: int):
                             # set microWakeWord cutoff
                             wake_word.probability_cutoff = threshold
 
+                            processing_step = f"micro_wake_word_inference:{wake_word.id}"
                             for micro_input in micro_inputs:
+                                inference_frames[wake_word.id] = inference_frames.get(wake_word.id, 0) + 1
                                 if wake_word.process_streaming(micro_input):
                                     wake_word.debug_probabilities = True
                                     activated = True
+                            if micro_inputs:
+                                last_inference_at[wake_word.id] = time.monotonic()
                         elif isinstance(wake_word, OpenWakeWord):
+                            processing_step = f"openwakeword_inference:{wake_word.id}"
                             for oww_input in oww_inputs:
+                                inference_frames[wake_word.id] = inference_frames.get(wake_word.id, 0) + 1
                                 for prob in wake_word.process_streaming(oww_input):
+                                    probability = float(prob)
+                                    last_probabilities[wake_word.id] = probability
+                                    probability_window_min[wake_word.id] = min(probability_window_min.get(wake_word.id, probability), probability)
+                                    probability_window_max[wake_word.id] = max(probability_window_max.get(wake_word.id, probability), probability)
                                     if prob > threshold:
                                         _LOGGER.debug("Wake word '%s' activated (probability %.3f exceeded threshold %.3f)", wake_word.wake_word, prob, threshold)  # type: ignore[attr-defined]
                                         activated = True
+                                        activation_score = probability
+                            if oww_inputs:
+                                last_inference_at[wake_word.id] = time.monotonic()
 
+                        if activated:
+                            now = time.monotonic()
+                            refractory_elapsed = None if last_active is None else now - last_active
+                            activation_counts[wake_word.id] = activation_counts.get(wake_word.id, 0) + 1
+                            should_log_activation = now - last_activation_log_at.get(wake_word.id, 0.0) >= 5.0
+                            if should_log_activation:
+                                last_activation_log_at[wake_word.id] = now
+                                _LOGGER.info(
+                                    "Wake-word activation: id=%s, count=%d, score=%s, threshold=%.3f, muted=%s, refractory_elapsed=%s, refractory_seconds=%.3f, pipeline_active=%s",
+                                    wake_word.id,
+                                    activation_counts[wake_word.id],
+                                    activation_score,
+                                    threshold,
+                                    state.muted,
+                                    None if refractory_elapsed is None else round(refractory_elapsed, 3),
+                                    state.refractory_seconds,
+                                    getattr(state.satellite, "_pipeline_active", None),
+                                )
+                        if activated and state.muted:
+                            if should_log_activation:
+                                _LOGGER.info("Wake-word activation suppressed: reason=muted, id=%s", wake_word.id)
                         if activated and not state.muted:
                             # Check refractory
-                            now = time.monotonic()
                             if (last_active is None) or ((now - last_active) > state.refractory_seconds):
                                 state.satellite.wakeup(wake_word)
                                 last_active = now
+                            else:
+                                if should_log_activation:
+                                    _LOGGER.info(
+                                        "Wake-word activation suppressed: reason=refractory, id=%s, elapsed=%.3f, refractory_seconds=%.3f",
+                                        wake_word.id,
+                                        now - last_active,
+                                        state.refractory_seconds,
+                                    )
 
                     # Always process to keep state correct
                     stopped = False
@@ -834,18 +984,20 @@ def process_audio(state: ServerState, mic, block_size: int):
                     # Apply stop word sensitivity threshold
                     state.stop_word.probability_cutoff = state.stop_word_threshold
                     # _LOGGER.debug("Set stop word probability cutoff to %.3f", state.stop_word_threshold)
+                    processing_step = f"stop_word_inference:{state.stop_word.id}"
                     for micro_input in micro_inputs:
+                        inference_frames[state.stop_word.id] = inference_frames.get(state.stop_word.id, 0) + 1
                         if state.stop_word.process_streaming(micro_input):
                             state.stop_word.debug_probabilities = True
                             stopped = True
 
                     if stopped and (state.stop_word.id in state.active_wake_words) and not state.muted:
-                        _LOGGER.debug("Stop word detected")
+                        _LOGGER.info("Stop word detected and accepted (pipeline_active=%s)", getattr(state.satellite, "_pipeline_active", None))
                         state.satellite.stop()
                 except Exception:  # pylint: disable=broad-except
-                    _LOGGER.exception("Unexpected error handling audio")
+                    _LOGGER.exception("Unexpected error handling audio (step=%s)", processing_step)
     except Exception:  # pylint: disable=broad-except
-        _LOGGER.exception("Unexpected error processing audio")
+        _LOGGER.exception("Unexpected error processing audio (recorder or audio processing thread)")
         sys.exit(1)
 
 
