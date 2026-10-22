@@ -76,11 +76,13 @@ class MpvMediaPlayer:
             self._done_callback = None
 
             if callback:
-                self._log.debug("Playlist finished, invoking done_callback")
+                self._log.info("Playback completion callback starting: %s", getattr(callback, "__qualname__", repr(callback)))
                 try:
                     callback()
                 except Exception as e:
                     self._log.exception("Error in done_callback: %s", e)
+                finally:
+                    self._log.info("Playback completion callback finished: %s", getattr(callback, "__qualname__", repr(callback)))
 
     def pause(self) -> None:
         """Pause playback."""
@@ -94,16 +96,25 @@ class MpvMediaPlayer:
 
     def stop(self) -> None:
         """Stop playback and invoke the done callback if present."""
-        self._log.debug("stop() called")
+        callback = self._done_callback
+        self._log.info(
+            "Playback stop requested (state=%s, callback=%s)",
+            self._player.state().name,
+            getattr(callback, "__qualname__", None),
+        )
 
         self._player.stop()
 
         if self._done_callback:
-            self._log.debug("Invoking done_callback due to stop()")
+            callback = self._done_callback
+            self._log.info("Playback stop invoking completion callback: %s", getattr(callback, "__qualname__", repr(callback)))
             try:
-                self._done_callback()
+                callback()
             finally:
                 self._done_callback = None
+                self._log.info("Playback stop callback finished: %s", getattr(callback, "__qualname__", repr(callback)))
+        else:
+            self._log.info("Playback stop had no completion callback")
 
     @property
     def is_playing(self) -> bool:
