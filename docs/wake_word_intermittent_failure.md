@@ -8,7 +8,7 @@ Mute/unmute is a recovery workaround reported by the operator. In the current co
 
 ## Working agreement
 
-1. Add low-overhead diagnostic logging without changing recognition or recovery behavior.
+1. Add low-volume diagnostic logging without changing thresholds or recovery behavior.
 2. The operator deploys the diagnostic build from the fork, waits for the failure, and saves logs covering before, during, and after recovery.
 3. Review those logs against the hypotheses below and agree on a specific fix.
 4. Test candidate fixes one at a time on the real assistant. Keep each run identifiable by commit/build and record whether the issue recurs and whether the candidate restores recognition.
@@ -16,20 +16,22 @@ Mute/unmute is a recovery workaround reported by the operator. In the current co
 
 ## Phase 1: diagnostic-only change
 
-Add rate-limited progress and state logs at these boundaries. Include a run/session identifier where useful, elapsed time, and counters; avoid logging every audio block.
+Add an independent watchdog and bounded, in-memory aggregates at these boundaries. The watchdog reports every five minutes and checks the audio worker once per second. It emits one warning when a processing stage makes no progress for ten seconds and one recovery event when that stage advances again. Each five-minute report contains at most thirty ten-second aggregate buckets; the interval aggregates are cleared after reporting.
 
 ### Audio capture and preprocessing (`linux_voice_assistant/__main__.py`, `linux_voice_assistant/webrtc.py`)
 
 - Log recorder start, sample rate, channel count, block size, and any recorder exit or exception.
-- Track the total count and monotonic interval between successfully read microphone blocks; a missing periodic heartbeat can indicate that the read or processing loop stopped progressing.
-- Track whether WebRTC processing is enabled, how often it returns no output, and the time of the last non-empty output.
-- Track feature extraction progress: number of feature frames produced by MicroWakeWord and, when enabled, OpenWakeWord.
+- Track successful microphone blocks and normalized RMS/peak, exact-zero, non-finite, and clipped-sample counts.
+- Track the same aggregate signal metrics after WebRTC processing and count empty outputs.
+- Track feature-frame count and finite-value range from MicroWakeWord feature extraction.
+- Report the active processing stage, stage age, last successful microphone-block age, and audio-worker liveness from the separate watchdog.
 - Do not log audio samples, encoded audio, transcripts, or other microphone content.
 
 ### Wake-word processing (`linux_voice_assistant/__main__.py`)
 
-- Periodically report configured/active model IDs, model type, and thresholds. OpenWakeWord probability summaries are available from its streaming output; MicroWakeWord currently exposes an activation result here, so report inference frame counts rather than inventing a probability value.
-- For each active model, record the last processing time, number of inference frames, and a rate-limited probability summary (for example min/max or last value over an interval). Log activations with model ID, score, and threshold.
+- Report the `pymicro-wakeword` version, active model IDs/types, loaded interpreter/model state, and thresholds.
+- Record probability call/result counts, None and non-finite outputs, min/max/mean/last finite probability, and threshold crossings for both engines. Use MicroWakeWord's public probability API once per feature frame; do not run inference a second time for diagnostics.
+- Record activation and suppression outcomes, with the score and threshold on activation.
 - When an activation is produced, log whether it was suppressed because of mute, refractory period, or `_pipeline_active`; include the relevant state and elapsed refractory time.
 - Record exceptions at feature/model boundaries with stack traces and identify the model/step. Preserve existing exception handling and behavior in this diagnostic-only phase.
 
@@ -43,8 +45,9 @@ Add rate-limited progress and state logs at these boundaries. Include a run/sess
 
 ### Logging constraints
 
-- Keep periodic logs low-frequency (roughly every 15–30 seconds) and event logs transition-based.
-- Include enough timestamps to locate stalls without producing an unbounded stream of per-block messages.
+- Keep normal periodic logs to one compact summary every five minutes. Only actual stalls, worker exit/recovery, model changes, and errors generate event logs.
+- Buckets contain aggregate metrics only and are overwritten/cleared after each report. Do not retain a per-block series, PCM samples, waveforms, encoded audio, transcripts, or serialized audio-derived time series.
+- A five-minute summary that shows low model probabilities can localize failure to signal/model input, but cannot prove what words were spoken or distinguish semantic model rejection from an acoustically degraded signal without recording audio.
 - Do not change timeouts, reset models, restart threads, alter thresholds, or otherwise change recognition behavior in this phase.
 
 ## Phase 2: real-device observation
@@ -71,7 +74,7 @@ Use the last progressing boundary and state transitions to distinguish these hyp
 | Feature frames and inference continue, but scores become abnormal or frozen | Wake-word model streaming state or its input |
 | Model activation occurs, but `wakeup()` is rejected with `_pipeline_active=True` | Pipeline completion/state transition failed to clear the gate |
 | Activation is rejected because muted/refractory state is wrong | Mute or refractory state path |
-| Counters appear healthy but there are no activations | Inspect score/input summaries and compare before/after mute; evidence may not yet distinguish model state from acoustic input |
+| Capture and features progress but no activation occurs | Compare the ten-second signal and probability buckets. Low/no scores despite energetic input localize the failure to the feature/model-input path; healthy expected scores with no accepted wake-up point to recognition gating. The logs cannot verify speech content. |
 
 An absent log line alone is not enough to identify a failure. Confirm that the relevant periodic heartbeat was expected and that the logging process itself remained alive.
 
