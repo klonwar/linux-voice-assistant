@@ -18,6 +18,119 @@ from linux_voice_assistant.audio_diagnostics import (
 )
 
 
+class _EndAudio(BaseException):
+    pass
+
+
+class _FakeWakeWord:
+    def __init__(self, model_id, probability):
+        self.id = model_id
+        self.probability = probability
+        self.calls = []
+
+    def process_streaming_prob(self, features):
+        self.calls.append(features.copy())
+        return self.probability
+
+
+class _FakeFeatures:
+    def process_streaming(self, audio):
+        assert isinstance(audio, bytes)
+        return [np.array([1.0], dtype=np.float32)]
+
+
+class _FakeRecorder:
+    def __init__(self, block_count):
+        self.block_count = block_count
+        self.calls = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def record(self, block_size):
+        self.calls += 1
+        if self.calls > self.block_count:
+            raise _EndAudio
+        return np.full((block_size, 1), 0.25, dtype=np.float32)
+
+
+class _FakeMicrophone:
+    name = "test microphone"
+
+    def __init__(self, block_count):
+        self.recorder_instance = _FakeRecorder(block_count)
+
+    def recorder(self, **_kwargs):
+        return self.recorder_instance
+
+
+class _FakeClock:
+    def __init__(self):
+        self.value = 0.0
+
+    def monotonic(self):
+        self.value += 0.01
+        return self.value
+
+
+@pytest.fixture(name="imported_main")
+def _import_main_fixture(monkeypatch, request):
+    import importlib
+
+    existing_modules = {name for name in sys.modules if name.startswith("linux_voice_assistant.")}
+
+    def restore_imported_modules():
+        for name in list(sys.modules):
+            if name.startswith("linux_voice_assistant.") and name not in existing_modules:
+                sys.modules.pop(name, None)
+
+    request.addfinalizer(restore_imported_modules)
+    for module_name, attributes in {
+        "mpv": {"MPV": object},
+        "soundcard": {"default_microphone": lambda: None, "all_microphones": lambda: []},
+        "webrtc_noise_gain": {"AudioProcessor": object},
+    }.items():
+        module = ModuleType(module_name)
+        for name, value in attributes.items():
+            setattr(module, name, value)
+        monkeypatch.setitem(sys.modules, module_name, module)
+
+    main_module = importlib.import_module("linux_voice_assistant.__main__")
+    monkeypatch.setattr(main_module, "MicroWakeWord", _FakeWakeWord)
+    monkeypatch.setattr(main_module, "MicroWakeWordFeatures", _FakeFeatures)
+    return main_module
+
+
+def _make_audio_harness(scenario, block_count):
+    from tests.unit.conftest import make_state
+
+    wake_word = _FakeWakeWord("okay_nabu", 0.95)
+    satellite = SimpleNamespace(
+        _is_streaming_audio=False,
+        _pipeline_active=False,
+        handle_audio=Mock(),
+        send_messages=Mock(),
+        wakeup=Mock(),
+        state=None,
+    )
+    state = make_state(
+        wake_words={wake_word.id: wake_word},
+        active_wake_words={wake_word.id},
+        stop_word=_FakeWakeWord("stop", 0.0),
+        audio_input_channels=1,
+        wake_word_1_threshold=0.9,
+        satellite=satellite,
+    )
+    state.wake_words_changed = True
+    state.muted = scenario == "muted"
+    state.available_wake_words = {wake_word.id: SimpleNamespace(probability_cutoff=0.9)}
+    satellite.state = state
+    return state, wake_word, satellite, AudioDiagnostics(), _FakeMicrophone(block_count)
+
+
 def test_micro_wake_word_activation_matches_existing_comparison():
     assert not micro_wake_word_activated(None, 0.9)
     assert not micro_wake_word_activated(0.89, 0.9)
@@ -46,117 +159,20 @@ def test_micro_probability_path_invokes_model_once_and_returns_same_score():
     assert model.calls == 1
 
 
-@pytest.mark.parametrize(
-    ("scenario", "expected_activations", "expected_wakeup_calls", "block_count"),
-    [
-        ("accepted", {"wakeup_called": 1}, 1, 1),
-        ("muted", {"muted": 1}, 0, 1),
-        ("refractory", {"wakeup_called": 1, "refractory": 1}, 1, 2),
-    ],
-)
-def test_process_audio_keeps_audio_flow_and_records_activation(
-    monkeypatch,
-    request,
-    scenario,
-    expected_activations,
-    expected_wakeup_calls,
-    block_count,
-):
-    import importlib
+@pytest.mark.parametrize("scenario", ["accepted", "muted", "refractory"])
+def test_process_audio_keeps_audio_flow_and_records_activation(monkeypatch, imported_main, scenario):
+    clock = _FakeClock()
+    monkeypatch.setattr(imported_main, "time", SimpleNamespace(monotonic=clock.monotonic))
+    expectations = {
+        "accepted": ({"wakeup_called": 1}, 1, 1),
+        "muted": ({"muted": 1}, 0, 1),
+        "refractory": ({"wakeup_called": 1, "refractory": 1}, 1, 2),
+    }
+    expected_activations, expected_wakeup_calls, block_count = expectations[scenario]
+    state, wake_word, satellite, diagnostics, microphone = _make_audio_harness(scenario, block_count)
 
-    existing_modules = {name for name in sys.modules if name.startswith("linux_voice_assistant.")}
-
-    def restore_imported_modules():
-        for name in list(sys.modules):
-            if name.startswith("linux_voice_assistant.") and name not in existing_modules:
-                sys.modules.pop(name, None)
-
-    request.addfinalizer(restore_imported_modules)
-    mpv_module = ModuleType("mpv")
-    mpv_module.MPV = object
-    webrtc_module = ModuleType("webrtc_noise_gain")
-    webrtc_module.AudioProcessor = object
-    monkeypatch.setitem(sys.modules, "mpv", mpv_module)
-    monkeypatch.setitem(sys.modules, "webrtc_noise_gain", webrtc_module)
-    main_module = importlib.import_module("linux_voice_assistant.__main__")
-
-    class EndAudio(BaseException):
-        pass
-
-    class FakeWakeWord:
-        def __init__(self, model_id, probability):
-            self.id = model_id
-            self.probability = probability
-            self.calls = []
-
-        def process_streaming_prob(self, features):
-            self.calls.append(features.copy())
-            return self.probability
-
-    class FakeFeatures:
-        def process_streaming(self, audio):
-            assert isinstance(audio, bytes)
-            return [np.array([1.0], dtype=np.float32)]
-
-    class FakeRecorder:
-        def __init__(self):
-            self.calls = 0
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
-            return False
-
-        def record(self, block_size):
-            self.calls += 1
-            if self.calls > block_count:
-                raise EndAudio
-            return np.full((block_size, 1), 0.25, dtype=np.float32)
-
-    class FakeMicrophone:
-        name = "test microphone"
-
-        def __init__(self):
-            self.recorder_instance = FakeRecorder()
-
-        def recorder(self, **_kwargs):
-            return self.recorder_instance
-
-    class FakeModel(FakeWakeWord):
-        pass
-
-    monkeypatch.setattr(main_module, "MicroWakeWord", FakeModel)
-    monkeypatch.setattr(main_module, "MicroWakeWordFeatures", FakeFeatures)
-
-    from tests.unit.conftest import make_state
-
-    wake_word = FakeModel("okay_nabu", 0.95)
-    stop_word = FakeModel("stop", 0.0)
-    satellite = SimpleNamespace(
-        _is_streaming_audio=False,
-        _pipeline_active=False,
-        handle_audio=Mock(),
-        send_messages=Mock(),
-        wakeup=Mock(),
-        state=None,
-    )
-    state = make_state(
-        wake_words={wake_word.id: wake_word},
-        active_wake_words={wake_word.id},
-        stop_word=stop_word,
-        audio_input_channels=1,
-        wake_word_1_threshold=0.9,
-        satellite=satellite,
-    )
-    state.wake_words_changed = True
-    state.muted = scenario == "muted"
-    state.available_wake_words = {wake_word.id: SimpleNamespace(probability_cutoff=0.9)}
-    satellite.state = state
-    diagnostics = AudioDiagnostics()
-
-    with pytest.raises(EndAudio):
-        main_module.process_audio(state, FakeMicrophone(), 16, diagnostics)
+    with pytest.raises(_EndAudio):
+        imported_main.process_audio(state, microphone, 16, diagnostics)
 
     assert satellite.handle_audio.call_count == block_count
     assert len(wake_word.calls) == block_count
