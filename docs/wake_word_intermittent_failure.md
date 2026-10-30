@@ -8,6 +8,8 @@ Mute/unmute is a recovery workaround reported by the operator. In the current co
 
 ## Working agreement
 
+The `test/upstream-sync` integration includes upstream microphone stream recovery. A failed recorder is reopened, and the process exits if recovery fails; an external restart policy may then restart it. This test build therefore differs from the diagnostic-only baseline below. Record reconnect and restart events when comparing observations, because they can interrupt or reset diagnostic intervals. The change is being tested, not treated as a confirmed fix for this incident.
+
 1. Add low-volume diagnostic logging without changing thresholds or recovery behavior.
 2. The operator deploys the diagnostic build from the fork, waits for the failure, and saves logs covering before, during, and after recovery.
 3. Review those logs against the hypotheses below and agree on a specific fix.
